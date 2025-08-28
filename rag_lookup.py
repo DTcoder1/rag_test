@@ -9,30 +9,32 @@
 #   python rag_lookup.py "label smoothing vs temperature scaling" --expand --deployment gpt-4o
 #
 # Programmatic:
-#   from rag_lookup import RAGLookup, generate_abstract_queries
+#   from rag_lookup import RAGLookup, generate_abstract_queries, answer_question_with_batches
 #   eng = RAGLookup(use_cross_encoder=False)
 #   docs = eng.list_docs()[:2]
-#   queries, per_query_hits, fused = eng.retrieve_with_llm_queries(
+#   queries, per_query_hits, fused_top, fused_all = eng.retrieve_with_llm_queries(
 #       "label smoothing vs temperature scaling", include_docs=docs
 #   )
 # ------------------------------------------------------------
 
 from __future__ import annotations
+
 import os
+import re
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
-from typing import Iterable
+from typing import Any, Dict, List, Tuple, Optional, Iterable
+from datetime import datetime
+
 from dotenv import load_dotenv
 load_dotenv()
-from datetime import datetime
-from pathlib import Path
+
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# --- Optional dependencies (safe import) ---
+# --- Optional deps ---
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
     _HAS_BM25 = True
@@ -45,9 +47,8 @@ try:
 except Exception:
     _HAS_XENC = False
 
-# --- LLM SDK (Azure) ---
+# --- Azure OpenAI SDK ---
 try:
-    # openai>=1.0
     from openai import AzureOpenAI  # type: ignore
     _HAS_AZURE_OPENAI = True
 except Exception:
@@ -56,7 +57,7 @@ except Exception:
 ARTIFACTS_DIR = Path("artifacts")
 INDICES_DIR = ARTIFACTS_DIR / "indices"
 DEFAULT_EMBED = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # small & fast
+DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # -------------------- IO helpers --------------------
 
@@ -94,403 +95,77 @@ def _load_doc_index(docstem: str):
 
     return index, vecid_to_chunkid, chunk_by_id, texts_for_bm25, ids_for_bm25
 
-def _evidence_from_hit(
-    hit: Hit,
-    *,
-    max_blocks: int = 3,
-    max_lines_per_block: int = 12
-) -> List[EvidenceItem]:
-    """
-    Select up to `max_blocks` distinct block_ids from a Hit and include their lines.
-    Falls back to line_ids_all order if block grouping can't be inferred.
-    """
-    block_ids = hit.citation.get("block_ids") or []
-    line_ids_all: List[str] = hit.citation.get("line_ids_all") or []
-    line_text_map: Dict[str, str] = hit.citation.get("line_text_map") or {}
-    line_bbox_map: Dict[str, Optional[List[float]]] = hit.citation.get("line_bbox_map") or {}
-
-    # If we have block_ids, try to keep lines grouped by block sequence
-    chosen_blocks = block_ids[:max_blocks] if block_ids else []
-    ev: List[EvidenceItem] = []
-
-    def _add_line(lid: str, blk: str = ""):
-        ev.append(
-            EvidenceItem(
-                doc=hit.doc,
-                id=hit.id,
-                file=str(hit.citation.get("file", "")),
-                page=str(hit.citation.get("pages", "")),
-                block_id=blk,
-                line_id=lid,
-                line_text=line_text_map.get(lid, "")
-            )
-        )
-
-    if chosen_blocks:
-        # naive mapping: assume line_ids_all are in reading order; slice evenly by blocks
-        # (Your ingest could later attach a real line->block map; this stays robust.)
-        per_block = max(1, len(line_ids_all) // max(1, len(chosen_blocks)))
-        cursor = 0
-        for b in chosen_blocks:
-            lines = line_ids_all[cursor:cursor+per_block]
-            for lid in lines[:max_lines_per_block]:
-                _add_line(lid, blk=b)
-            cursor += per_block
-    else:
-        # no block info; just take first few lines
-        for lid in line_ids_all[: max_blocks * max_lines_per_block]:
-            _add_line(lid, blk="")
-
-    return ev
-
-def _chunked(it: Iterable[Any], size: int) -> Iterable[List[Any]]:
-    buf: List[Any] = []
-    for x in it:
-        buf.append(x)
-        if len(buf) >= size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
-        
-def answer_question_with_batches(
-    question: str,
-    hits: List[Hit],
-    *,
-    deployment: Optional[str] = None,
-    api_version: str = "2024-12-01-preview",
-    max_chunks_per_call: int = 5,
-    max_blocks_per_hit: int = 3,
-    max_lines_per_block: int = 12,
-    temperature: float = 0.1,
-    top_p: float = 0.9,
-    max_tokens_partial: int = 700,
-    max_tokens_final: int = 900,
-) -> Dict[str, Any]:
-    """
-    1) Split selected hits into batches (≤ max_chunks_per_call per request).
-    2) For each batch: send evidence (capped at ≤3 blocks/hit) and get a *JSON* partial answer with
-       per-line 'why_used' reasoning.
-    3) Synthesize all partials into a unified *JSON* final answer.
-    Returns a JSON-able dict.
-    """
-    llm = ChatLLM(provider="azure", deployment=deployment, api_version=api_version)
-
-    partials: List[PartialAnswer] = []
-    # -------- per-batch requests --------
-    for batch_idx, batch in enumerate(_chunked(hits, max_chunks_per_call), start=1):
-        # Build evidence payload for this batch
-        batch_evidence: List[Dict[str, Any]] = []
-        for h in batch:
-            ev_items = _evidence_from_hit(h, max_blocks=max_blocks_per_hit, max_lines_per_block=max_lines_per_block)
-            # Pack into compact JSON entries for the model
-            for it in ev_items:
-                batch_evidence.append({
-                    "doc": it.doc,
-                    "id": it.id,
-                    "file": it.file,
-                    "page": it.page,
-                    "block_id": it.block_id,
-                    "line_id": it.line_id,
-                    "line_text": it.line_text,
-                })
-
-        sys_msg = (
-            "You are a careful analyst. Using ONLY the provided evidence lines, answer the user's question.\n"
-            "Return STRICT JSON with keys: {\"partial_answer\": str, \"evidence\": [{\"doc\": str, \"id\": str, "
-            "\"file\": str, \"page\": str, \"block_id\": str, \"line_id\": str, \"why_used\": str}] }.\n"
-            "For each evidence entry you include, attach a brief 'why_used' explanation (1-2 sentences) explaining "
-            "how that specific line supports the answer. Do not invent citations. Do not reference any outside info."
-        )
-
-        user_payload = {
-            "question": question,
-            "evidence_lines": batch_evidence
-        }
-
-        content = llm.chat(
-            [
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens_partial,
-        )
-
-        # Parse model JSON; be robust to code fences
-        parsed = None
-        try:
-            parsed = json.loads(content)
-        except Exception:
-            if "```" in content:
-                for part in content.split("```"):
-                    s = part.strip()
-                    if s.lower().startswith("json"):
-                        s = s[4:].strip()
-                    try:
-                        parsed = json.loads(s)
-                        break
-                    except Exception:
-                        pass
-        if not parsed or "partial_answer" not in parsed:
-            parsed = {"partial_answer": str(content).strip(), "evidence": []}
-
-        ev_with_why: List[EvidenceItem] = []
-        for e in parsed.get("evidence", []):
-            ev_with_why.append(
-                EvidenceItem(
-                    doc=e.get("doc",""),
-                    id=e.get("id",""),
-                    file=e.get("file",""),
-                    page=e.get("page",""),
-                    block_id=e.get("block_id",""),
-                    line_id=e.get("line_id",""),
-                    line_text="",  # keep payload small in the final merge; lines already known above
-                    why_used=e.get("why_used","")
-                )
-            )
-
-        partials.append(PartialAnswer(
-            batch_index=batch_idx,
-            partial_answer=parsed.get("partial_answer", ""),
-            evidence=ev_with_why
-        ))
-
-    # -------- final synthesis --------
-    synthesis_sys = (
-        "You are synthesizing several partial answers. Merge them into a single, precise final answer.\n"
-        "Return STRICT JSON with keys:\n"
-        "{\n"
-        "  \"final_answer\": str,\n"
-        "  \"merged_evidence\": [ {\"doc\": str, \"id\": str, \"file\": str, \"page\": str, "
-        "\"block_id\": str, \"line_id\": str, \"why_used\": str} ],\n"
-        "  \"notes\": str\n"
-        "}\n"
-        "Deduplicate overlapping evidence by (doc,id,line_id). Keep the best 'why_used'. "
-        "Do not add new facts beyond the partials."
-    )
-
-    synthesis_user = {
-        "question": question,
-        "partials": [
-            {
-                "batch_index": p.batch_index,
-                "partial_answer": p.partial_answer,
-                "evidence": [e.__dict__ for e in p.evidence],
-            } for p in partials
-        ]
-    }
-
-    final_content = llm.chat(
-        [
-            {"role": "system", "content": synthesis_sys},
-            {"role": "user", "content": json.dumps(synthesis_user, ensure_ascii=False)},
-        ],
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens_final,
-    )
-
-    final_parsed = None
-    try:
-        final_parsed = json.loads(final_content)
-    except Exception:
-        if "```" in final_content:
-            for part in final_content.split("```"):
-                s = part.strip()
-                if s.lower().startswith("json"):
-                    s = s[4:].strip()
-                try:
-                    final_parsed = json.loads(s)
-                    break
-                except Exception:
-                    pass
-    if not final_parsed or "final_answer" not in final_parsed:
-        final_parsed = {
-            "final_answer": str(final_content).strip(),
-            "merged_evidence": [],
-            "notes": "Model returned non-JSON or malformed JSON; captured raw text."
-        }
-
-    # Return a compact, capture-everything envelope
-    return {
-        "question": question,
-        "batches": [
-            {
-                "batch_index": p.batch_index,
-                "partial_answer": p.partial_answer,
-                "evidence": [e.__dict__ for e in p.evidence]
-            } for p in partials
-        ],
-        "final": final_parsed
-    }
-
 def _prepare_answer_paths(answer_out: Optional[str]) -> Tuple[Path, Path]:
-    """
-    Returns (primary_path, session_path).
-    - primary_path: args.answer_out or out/answer.json
-    - session_path: out/YYYYMMDD_HHMMSS/<filename>
-    Ensures both parent dirs exist.
-    """
     base_path = Path(answer_out) if answer_out else Path("out") / "answer.json"
-
-    # ensure base out directory exists
     base_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # session folder with timestamp to the second
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = base_path.parent / stamp
     session_dir.mkdir(parents=True, exist_ok=True)
-
     session_path = session_dir / base_path.name
     return base_path, session_path
-# -------------------- Provider-agnostic chat wrapper --------------------
 
-class ChatLLM:
-    """
-    Minimal provider-agnostic chat wrapper.
-    Currently implements Azure OpenAI via AzureOpenAI SDK.
-    Extend later with OpenAI(), Anthropic(), etc. while keeping the same interface.
-    """
-    def __init__(
-        self,
-        *,
-        provider: str = "azure",
-        deployment: Optional[str] = None,
-        azure_endpoint: Optional[str] = None,
-        api_key: Optional[str] = None,
-        api_version: Optional[str] = None,
-    ):
-        provider = (provider or "azure").lower()
-        if provider != "azure":
-            raise RuntimeError(f"Unsupported provider '{provider}' (only 'azure' implemented)")
+# -------------------- small text utils --------------------
 
-        if not _HAS_AZURE_OPENAI:
-            raise RuntimeError("openai package not installed. Run: pip install openai")
+def _unwrap_code_fences(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    t = s.strip()
+    if t.startswith("```") and t.endswith("```"):
+        parts = t.split("```")
+        for part in parts:
+            p = part.strip()
+            if not p:
+                continue
+            if p.lower().startswith("json"):
+                p = p[4:].strip()
+            return p
+    return t
 
-        # Resolve from env if not passed
-        self.deployment = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-        self.azure_endpoint = (azure_endpoint or os.environ.get("AZURE_OPENAI_API_TARGET_URI") or "").rstrip("/")
-        self.api_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY")
-        self.api_version = api_version or os.environ.get("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
-
-        if not (self.deployment and self.azure_endpoint and self.api_key):
-            raise RuntimeError(
-                "Missing Azure config. Need AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_TARGET_URI, "
-                "and a deployment name (arg or AZURE_OPENAI_DEPLOYMENT)."
-            )
-
-        # Initialize SDK client
-        self.client = AzureOpenAI(
-            api_version=self.api_version,
-            azure_endpoint=self.azure_endpoint,
-            api_key=self.api_key,
-        )
-
-    def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """
-        Send a chat completion request; returns assistant content string.
-        kwargs are passed to client.chat.completions.create (e.g., temperature, max_tokens).
-        """
-        resp = self.client.chat.completions.create(
-            messages=messages,
-            model=self.deployment,   # Azure uses 'model' to pass the *deployment name*
-            **kwargs,
-        )
-        content = resp.choices[0].message.content or ""
-        return content.strip()
-
-# -------------------- LLM query expansion --------------------
-
-def generate_abstract_queries(
-    seed_query: str,
-    *,
-    n: int = 5,
-    deployment: Optional[str] = None,          # Azure *deployment name* (e.g., "gpt-4o")
-    api_version: str = "2024-12-01-preview",   # default to current preview per Azure docs
-    extra_instructions: Optional[str] = None,  # domain hints, doc types, etc.
-    temperature: float = 0.2,
-    top_p: float = 0.95,
-    max_tokens: int = 600,
-) -> List[str]:
-    """
-    Use Azure OpenAI (via SDK) to turn a single query into N higher-recall variations.
-    Returns a list with exactly up to N non-empty, deduped queries (backfilled by seed if short).
-    """
-    # Build wrapper (reads env if args not provided)
-    llm = ChatLLM(
-        provider="azure",
-        deployment=deployment,
-        api_version=api_version,
-    )
-
-    sys_msg = (
-        "You are an expert search query reformulator for scholarly/technical retrieval. "
-        f"Produce EXACTLY {n} diverse, precise queries that improve recall. "
-        "Cover alternate phrasings, abbreviations, synonyms, adjacent concepts, and likely section headers. "
-        "Avoid near-duplicates. Each under 16 words. "
-        'Return ONLY JSON: {"queries": ["...","...","...","...","..."]}.'
-    )
-    if extra_instructions:
-        sys_msg += f" Additional context: {extra_instructions.strip()}"
-
-    messages = [
-        {"role": "system", "content": sys_msg},
-        {"role": "user", "content": f"Seed query: {seed_query.strip()}"},
-    ]
-
+def _jsonish_extract_field(s: str, field: str) -> Optional[str]:
+    """Extract `"field": "..."` from a JSON-ish blob (even if outer JSON is broken)."""
+    if not isinstance(s, str):
+        return None
+    s = _unwrap_code_fences(s)
+    pat = rf'"{re.escape(field)}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    m = re.search(pat, s, flags=re.DOTALL)
+    if not m:
+        return None
+    raw = m.group(1)
     try:
-        content = llm.chat(
-            messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-        )
-    except Exception as e:
-        # Bubble up; caller prints a clear Azure error
-        raise
-
-    # Parse JSON result safely
-    queries: List[str] = []
-    try:
-        obj = json.loads(content)
-        q = obj.get("queries", [])
-        if isinstance(q, list):
-            queries = [str(s).strip() for s in q if str(s).strip()]
+        return json.loads(f'"{raw}"')  # unescape
     except Exception:
-        # try code fences
-        if "```" in content:
-            for part in content.split("```"):
-                s = part.strip()
-                if s.lower().startswith("json"):
-                    s = s[4:].strip()
-                try:
-                    obj = json.loads(s)
-                    q = obj.get("queries", [])
-                    if isinstance(q, list):
-                        queries = [str(x).strip() for x in q if str(x).strip()]
-                        break
-                except Exception:
-                    pass
-        if not queries:
-            # last-resort: line-based
-            lines = [ln.strip("-•\t ") for ln in content.splitlines() if ln.strip()]
-            queries = lines[:n]
+        return raw
 
-    # Dedupe and ensure length n
-    seen, uniq = set(), []
-    for q in queries:
-        if q and q not in seen:
-            uniq.append(q)
-            seen.add(q)
-        if len(uniq) >= n:
-            break
-    while len(uniq) < n:
-        uniq.append(seed_query)
-    return uniq[:n]
+def _sanitize_text_field(s: Any) -> str:
+    """Ensure plain prose (no code fences, no nested JSON objects)."""
+    if not isinstance(s, str):
+        return str(s)
+    t = _unwrap_code_fences(s).strip()
+    if t and (t.startswith("{") or t.startswith("[")):
+        try:
+            inner = json.loads(t)
+            if isinstance(inner, dict) and "final_answer" in inner:
+                return _sanitize_text_field(inner["final_answer"])
+            return json.dumps(inner, ensure_ascii=False)
+        except Exception:
+            extracted = _jsonish_extract_field(t, "final_answer")
+            if extracted:
+                return extracted.strip()
+    else:
+        extracted = _jsonish_extract_field(t, "final_answer")
+        if extracted:
+            return extracted.strip()
+    return t
 
-# -------------------- Data models --------------------
+def _sanitize_final_object(obj: Dict[str, Any]) -> Dict[str, Any]:
+    obj["final_answer"] = _sanitize_text_field(obj.get("final_answer", ""))
+    me = obj.get("merged_evidence", [])
+    if not isinstance(me, list):
+        obj["merged_evidence"] = []
+    obj["notes"] = _sanitize_text_field(obj.get("notes", ""))
+    return obj
+
+# -------------------- data models --------------------
 
 @dataclass
 class Hit:
@@ -498,7 +173,7 @@ class Hit:
     doc: str
     id: str
     score: float
-    citation: Dict[str, Any]  # includes: file/pages/columns/block_ids + line_ids_all + line_text_map + line_bbox_map
+    citation: Dict[str, Any]
 
 @dataclass
 class RetrievedInternal:
@@ -515,8 +190,6 @@ class RetrievedInternal:
     line_ids_all: List[str]
     line_text_map: Dict[str, str]
     line_bbox_map: Dict[str, Optional[List[float]]]
-    
-    
 
 @dataclass
 class EvidenceItem:
@@ -535,7 +208,210 @@ class PartialAnswer:
     partial_answer: str
     evidence: List[EvidenceItem]
 
-# -------------------- Core RAG engine --------------------
+# -------------------- provider-agnostic chat wrapper --------------------
+
+class ChatLLM:
+    """
+    Minimal wrapper (Azure OpenAI only for now).
+    Reads config from args or env:
+      - AZURE_OPENAI_DEPLOYMENT
+      - AZURE_OPENAI_API_TARGET_URI
+      - AZURE_OPENAI_API_KEY
+      - AZURE_OPENAI_API_VERSION (optional)
+    """
+    def __init__(
+        self,
+        *,
+        provider: str = "azure",
+        deployment: Optional[str] = None,
+        azure_endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        api_version: Optional[str] = None,
+    ):
+        provider = (provider or "azure").lower()
+        if provider != "azure":
+            raise RuntimeError(f"Unsupported provider '{provider}' (only 'azure' implemented)")
+        if not _HAS_AZURE_OPENAI:
+            raise RuntimeError("openai package not installed. Run: pip install openai")
+
+        self.deployment = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        self.azure_endpoint = (azure_endpoint or os.environ.get("AZURE_OPENAI_API_TARGET_URI") or "").rstrip("/")
+        self.api_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY")
+        self.api_version = api_version or os.environ.get("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
+
+        if not (self.deployment and self.azure_endpoint and self.api_key):
+            raise RuntimeError("Missing Azure config. Need AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_TARGET_URI, and a deployment name.")
+
+        self.client = AzureOpenAI(
+            api_version=self.api_version,
+            azure_endpoint=self.azure_endpoint,
+            api_key=self.api_key,
+        )
+
+    def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        resp = self.client.chat.completions.create(
+            messages=messages,
+            model=self.deployment,  # Azure uses 'model' for the deployment name
+            **kwargs,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+# -------------------- LLM query expansion --------------------
+
+def generate_abstract_queries(
+    seed_query: str,
+    *,
+    n: int = 5,
+    deployment: Optional[str] = None,
+    api_version: str = "2024-12-01-preview",
+    extra_instructions: Optional[str] = None,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+    max_tokens: int = 600,
+) -> List[str]:
+    llm = ChatLLM(provider="azure", deployment=deployment, api_version=api_version)
+
+    sys_msg = (
+        "You are an expert search query reformulator for scholarly/technical retrieval. "
+        f"Produce EXACTLY {n} diverse, precise queries that improve recall. "
+        "Cover alternate phrasings, abbreviations, synonyms, adjacent concepts, and likely section headers. "
+        "Avoid near-duplicates. Each under 16 words. "
+        'Return ONLY JSON: {"queries": ["...","...","...","...","..."]}.'
+    )
+    if extra_instructions:
+        sys_msg += f" Additional context: {extra_instructions.strip()}"
+
+    messages = [
+        {"role": "system", "content": sys_msg},
+        {"role": "user", "content": f"Seed query: {seed_query.strip()}"},
+    ]
+
+    content = llm.chat(
+        messages,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+    )
+
+    queries: List[str] = []
+    try:
+        obj = json.loads(content)
+        q = obj.get("queries", [])
+        if isinstance(q, list):
+            queries = [str(s).strip() for s in q if str(s).strip()]
+    except Exception:
+        if "```" in content:
+            for part in content.split("```"):
+                s = part.strip()
+                if s.lower().startswith("json"):
+                    s = s[4:].strip()
+                try:
+                    obj = json.loads(s)
+                    q = obj.get("queries", [])
+                    if isinstance(q, list):
+                        queries = [str(x).strip() for x in q if str(x).strip()]
+                        break
+                except Exception:
+                    pass
+        if not queries:
+            lines = [ln.strip("-•\t ") for ln in content.splitlines() if ln.strip()]
+            queries = lines[:n]
+
+    seen, uniq = set(), []
+    for q in queries:
+        if q and q not in seen:
+            uniq.append(q)
+            seen.add(q)
+        if len(uniq) >= n:
+            break
+    while len(uniq) < n:
+        uniq.append(seed_query)
+    return uniq[:n]
+
+# -------------------- evidence helpers --------------------
+
+def _evidence_from_hit(
+    hit: Hit,
+    *,
+    max_blocks: int = 3,
+    max_lines_per_block: int = 12
+) -> List[EvidenceItem]:
+    block_ids = hit.citation.get("block_ids") or []
+    line_ids_all: List[str] = hit.citation.get("line_ids_all") or []
+    line_text_map: Dict[str, str] = hit.citation.get("line_text_map") or {}
+
+    chosen_blocks = block_ids[:max_blocks] if block_ids else []
+    ev: List[EvidenceItem] = []
+
+    def _add_line(lid: str, blk: str = ""):
+        ev.append(
+            EvidenceItem(
+                doc=hit.doc,
+                id=hit.id,
+                file=str(hit.citation.get("file", "")),
+                page=str(hit.citation.get("pages", "")),
+                block_id=blk,
+                line_id=lid,
+                line_text=line_text_map.get(lid, "")
+            )
+        )
+
+    if chosen_blocks:
+        per_block = max(1, len(line_ids_all) // max(1, len(chosen_blocks)))
+        cursor = 0
+        for b in chosen_blocks:
+            lines = line_ids_all[cursor:cursor+per_block]
+            for lid in lines[:max_lines_per_block]:
+                _add_line(lid, blk=b)
+            cursor += per_block
+    else:
+        for lid in line_ids_all[: max_blocks * max_lines_per_block]:
+            _add_line(lid, blk="")
+
+    return ev
+
+def _chunked(it: Iterable[Any], size: int) -> Iterable[List[Any]]:
+    buf: List[Any] = []
+    for x in it:
+        buf.append(x)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+def _fallback_merge_evidence(partials: List[PartialAnswer], limit: int = 12) -> List[Dict[str, Any]]:
+    """
+    Deduplicate and select evidence from partial batches when the final response
+    doesn't include valid merged_evidence. Keep the longest `why_used` per (doc,id,line_id).
+    Preserve first-seen ordering. Cap to `limit`.
+    """
+    merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str, str]] = []
+
+    for p in partials:
+        for e in p.evidence:
+            key = (e.doc, e.id, e.line_id)
+            edict = {
+                "doc": e.doc,
+                "id": e.id,
+                "file": e.file,
+                "page": e.page,
+                "block_id": e.block_id,
+                "line_id": e.line_id,
+                "why_used": (e.why_used or "").strip(),
+            }
+            if key not in merged:
+                merged[key] = edict
+                order.append(key)
+            else:
+                if len(edict["why_used"]) > len(merged[key]["why_used"]):
+                    merged[key] = edict
+
+    return [merged[k] for k in order[:limit]]
+
+# -------------------- core RAG engine --------------------
 
 class RAGLookup:
     def __init__(
@@ -618,13 +494,7 @@ class RAGLookup:
         final_topk: int = 8,
         bm25_weight: float = 0.35,
         faiss_topk_per_doc: int = 12,
-    ) -> Tuple[List[str], List[List[Hit]], List[Hit]]:
-        """
-        1) Expand seed_query into n_queries via Azure OpenAI (SDK).
-        2) For each query: retrieve top per_query_topk.
-        3) Fuse all results by (doc,id) keeping max score. Return:
-           (queries, per_query_hits, fused_top_hits)
-        """
+    ) -> Tuple[List[str], List[List[Hit]], List[Hit], List[Hit]]:
         queries: List[str] = [seed_query]
         per_query_hits: List[List[Hit]] = []
 
@@ -656,10 +526,11 @@ class RAGLookup:
                 if key not in pooled or h.score > pooled[key].score:
                     pooled[key] = h
 
-        fused = sorted(pooled.values(), key=lambda x: x.score, reverse=True)
-        return queries, per_query_hits, fused[:final_topk]
+        fused_all = sorted(pooled.values(), key=lambda x: x.score, reverse=True)
+        fused_top = fused_all[:final_topk]
+        return queries, per_query_hits, fused_top, fused_all
 
-    # -------------------- internals --------------------
+    # internals
     def _hybrid_candidates(
         self,
         query: str,
@@ -681,7 +552,7 @@ class RAGLookup:
                 if cid and cid in chunks:
                     sem_pairs.append((cid, float(score)))
 
-            # lexical (BM25) — optional
+            # lexical (BM25)
             lex_pairs: List[Tuple[str, float]] = []
             if _HAS_BM25 and bm25_texts:
                 tok = [t.split() for t in bm25_texts]
@@ -691,7 +562,6 @@ class RAGLookup:
                     top_idx = np.argsort(scrs)[::-1][:faiss_topk_per_doc]
                     lex_pairs = [(bm25_ids[i], float(scrs[i])) for i in top_idx]
 
-            # z-norm per source
             def _znorm(vals: List[float]) -> List[float]:
                 if not vals:
                     return []
@@ -714,12 +584,12 @@ class RAGLookup:
                 sem_s = sem_map.get(cid, 0.0)
                 lex_s = lex_map.get(cid, 0.0) if _HAS_BM25 else 0.0
                 fused = (1 - bm25_weight) * sem_s + bm25_weight * lex_s
+
                 rec = chunks[cid]
                 meta = rec["meta"]
 
                 block_ids: List[str] = meta.get("block_ids", [])
                 line_ids_all: List[str] = meta.get("line_ids", []) or []
-
                 line_text_map: Dict[str, str] = meta.get("line_text_map") or {}
                 line_bbox_map: Dict[str, Optional[List[float]]] = meta.get("line_bbox_map") or {}
 
@@ -769,14 +639,13 @@ class RAGLookup:
                 i = int(np.argmax(sim_to_q[candidates]))
                 selected.append(candidates.pop(i))
                 continue
-            div = np.max(cand_vecs[candidates] @ cand_vecs[selected].T, axis=1)  # diversity penalty
+            div = np.max(cand_vecs[candidates] @ cand_vecs[selected].T, axis=1)
             mmr_scores = lambda_mult * sim_to_q[candidates] - (1 - lambda_mult) * div
             i = int(np.argmax(mmr_scores))
             selected.append(candidates.pop(i))
-
         return selected
 
-    # ---- neighbors (prev/next chunks) ----
+    # neighbors (prev/next chunks)
     def _load_chunks_cache(self, docstem: str) -> None:
         if docstem in self._chunk_cache:
             return
@@ -843,6 +712,174 @@ class RAGLookup:
 
         return _mk(by_id.get(prev_id)), _mk(by_id.get(next_id))
 
+# -------------------- Answering --------------------
+
+def answer_question_with_batches(
+    question: str,
+    hits: List[Hit],
+    *,
+    deployment: Optional[str] = None,
+    api_version: str = "2024-12-01-preview",
+    max_chunks_per_call: int = 5,
+    max_blocks_per_hit: int = 3,
+    max_lines_per_block: int = 12,
+    temperature: float = 0.1,
+    top_p: float = 0.9,
+    max_tokens_partial: int = 700,
+    max_tokens_final: int = 900,
+) -> Dict[str, Any]:
+    """
+    1) Split hits into batches (≤ max_chunks_per_call).
+    2) For each batch: send capped evidence & get STRICT JSON partial answer (with why_used).
+    3) Synthesize partials into final JSON answer.
+    Always returns a dict with 'final.merged_evidence' non-empty if any partials had evidence.
+    """
+    llm = ChatLLM(provider="azure", deployment=deployment, api_version=api_version)
+
+    partials: List[PartialAnswer] = []
+
+    # --- per-batch partial answers ---
+    for batch_idx, batch in enumerate(_chunked(hits, max_chunks_per_call), start=1):
+        batch_evidence: List[Dict[str, Any]] = []
+        for h in batch:
+            ev_items = _evidence_from_hit(h, max_blocks=max_blocks_per_hit, max_lines_per_block=max_lines_per_block)
+            for it in ev_items:
+                batch_evidence.append({
+                    "doc": it.doc, "id": it.id, "file": it.file, "page": it.page,
+                    "block_id": it.block_id, "line_id": it.line_id, "line_text": it.line_text
+                })
+
+        sys_msg = (
+            "You are a careful analyst. Using ONLY the provided evidence lines, answer the user's question.\n"
+            "Return STRICT JSON with keys: {\"partial_answer\": str, \"evidence\": [{\"doc\": str, \"id\": str, "
+            "\"file\": str, \"page\": str, \"block_id\": str, \"line_id\": str, \"why_used\": str}] }.\n"
+            "For each evidence entry, add a brief 'why_used' explaining how that line supports the answer. "
+            "Do not invent citations or use outside info."
+        )
+        user_payload = {"question": question, "evidence_lines": batch_evidence}
+
+        content = llm.chat(
+            [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens_partial,
+            response_format={"type": "json_object"},  # <- enforce JSON mode for partials
+        )
+
+        parsed = None
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            if "```" in content:
+                for part in content.split("```"):
+                    s = part.strip()
+                    if s.lower().startswith("json"):
+                        s = s[4:].strip()
+                    try:
+                        parsed = json.loads(s)
+                        break
+                    except Exception:
+                        pass
+        if not parsed or "partial_answer" not in parsed:
+            parsed = {"partial_answer": str(content).strip(), "evidence": []}
+
+        parsed["partial_answer"] = _sanitize_text_field(parsed.get("partial_answer", ""))
+
+        ev_with_why: List[EvidenceItem] = []
+        for e in parsed.get("evidence", []):
+            ev_with_why.append(
+                EvidenceItem(
+                    doc=e.get("doc",""), id=e.get("id",""), file=e.get("file",""),
+                    page=e.get("page",""), block_id=e.get("block_id",""), line_id=e.get("line_id",""),
+                    line_text="", why_used=_sanitize_text_field(e.get("why_used",""))
+                )
+            )
+
+        partials.append(PartialAnswer(batch_index=batch_idx, partial_answer=parsed["partial_answer"], evidence=ev_with_why))
+
+    # --- final synthesis ---
+    synthesis_sys = (
+        "You are synthesizing several partial answers. Merge them into a single, precise final answer.\n"
+        "Return STRICT JSON ONLY (no markdown, no code fences) with keys exactly:\n"
+        "{\n"
+        "  \"final_answer\": str,\n"
+        "  \"merged_evidence\": [ {\"doc\": str, \"id\": str, \"file\": str, \"page\": str, "
+        "\"block_id\": str, \"line_id\": str, \"why_used\": str} ],\n"
+        "  \"notes\": str\n"
+        "}\n"
+        "Hard constraints:\n"
+        "- 'final_answer' must be plain prose (NOT JSON), ≤ 120 words.\n"
+        "- 'merged_evidence' MUST NOT be empty if any batch contained evidence; deduplicate by (doc,id,line_id) and keep ≤ 12 items.\n"
+        "- Do NOT add keys. Do NOT nest JSON inside strings. Do NOT use backticks."
+    )
+    synthesis_user = {
+        "question": question,
+        "partials": [
+            {
+                "batch_index": p.batch_index,
+                "partial_answer": p.partial_answer,
+                "evidence": [e.__dict__ for e in p.evidence],
+            } for p in partials
+        ]
+    }
+
+    final_content = llm.chat(
+        [
+            {"role": "system", "content": synthesis_sys},
+            {"role": "user", "content": json.dumps(synthesis_user, ensure_ascii=False)},
+        ],
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens_final,
+        response_format={"type": "json_object"},
+    )
+
+    final_parsed = None
+    try:
+        final_parsed = json.loads(final_content)
+    except Exception:
+        if "```" in final_content:
+            for part in final_content.split("```"):
+                s = part.strip()
+                if s.lower().startswith("json"):
+                    s = s[4:].strip()
+                try:
+                    final_parsed = json.loads(s)
+                    break
+                except Exception:
+                    pass
+
+    if not final_parsed or "final_answer" not in final_parsed:
+        final_parsed = {
+            "final_answer": str(final_content).strip(),
+            "merged_evidence": [],
+            "notes": "Model returned non-JSON or malformed JSON; captured raw text."
+        }
+
+    final_parsed = _sanitize_final_object(final_parsed)
+
+    # --- guaranteed merged_evidence fallback ---
+    any_partial_evidence = any(p.evidence for p in partials)
+    if (not isinstance(final_parsed.get("merged_evidence"), list) or len(final_parsed["merged_evidence"]) == 0) and any_partial_evidence:
+        final_parsed["merged_evidence"] = _fallback_merge_evidence(partials, limit=12)
+        if not final_parsed.get("notes"):
+            final_parsed["notes"] = "merged_evidence synthesized from partial batches (model omitted/invalid)."
+
+    return {
+        "question": question,
+        "batches": [
+            {
+                "batch_index": p.batch_index,
+                "partial_answer": p.partial_answer,
+                "evidence": [e.__dict__ for e in p.evidence]
+            } for p in partials
+        ],
+        "final": final_parsed
+    }
+
 # -------------------- CLI --------------------
 
 if __name__ == "__main__":
@@ -870,12 +907,12 @@ if __name__ == "__main__":
     ap.add_argument("question", type=str, help="Your query")
     ap.add_argument("--docs", nargs="*", default=None, help="Docstems to search (default: all available)")
     ap.add_argument("--topk", type=int, default=6, help="Top-k after MMR")
-    ap.add_argument("--bm25", type=float, default=0.35, help="BM25 fusion weight (0..1); ignored if rank-bm25 not installed")
+    ap.add_argument("--bm25", type=float, default=0.35, help="BM25 fusion weight (0..1); ignored if rank-bm25 not installed)")
     ap.add_argument("--faiss-per-doc", type=int, default=12, help="FAISS topk per document before re-ranking")
     ap.add_argument("--cross", action="store_true", help="Use cross-encoder re-ranking (requires cross-encoder)")
     ap.add_argument("--preview", type=int, default=220, help="Preview chars in console (0 = full text)")
 
-    # LLM expansion controls
+    # LLM expansion
     ap.add_argument("--expand", action="store_true", help="Use Azure OpenAI to expand the query into multiple sub-queries")
     ap.add_argument("--n-queries", type=int, default=5, help="Number of LLM-generated queries for expansion")
     ap.add_argument("--deployment", type=str, default=None, help="Azure OpenAI deployment name (e.g., gpt-4o)")
@@ -884,21 +921,31 @@ if __name__ == "__main__":
     ap.add_argument("--final-topk", type=int, default=8, help="Final number of results when using --expand")
     ap.add_argument("--per-query-topk", type=int, default=6, help="Per-subquery top-k after MMR when using --expand")
     ap.add_argument("--per-query-print-k", type=int, default=5, help="How many results to print per subquery")
-    
-    ap.add_argument("--answer", action="store_true", help="Answer the question by batching chunks to the LLM and return unified JSON")
-    ap.add_argument("--answer-out", type=str, default=None, help="If set, write the unified JSON to this file")
 
+    # Answering
+    ap.add_argument("--answer", action="store_true", help="Batch evidence to LLM and return unified JSON")
+    ap.add_argument("--answer-batch-size", type=int, default=5, help="Chunks per LLM call during answering")
+    ap.add_argument("--answer-out", type=str, default=None, help="Write unified JSON to this path (and a timestamped session copy)")
 
     args = ap.parse_args()
 
-    eng = RAGLookup(use_cross_encoder=args.cross)
+    # Build engine
+    if args.cross and not _HAS_XENC:
+        print("(Cross-encoder not installed; proceeding without it.)")
+    try:
+        eng = RAGLookup(use_cross_encoder=args.cross)
+    except Exception as e:
+        print(f"Failed to init RAG engine: {e}", file=sys.stderr)
+        sys.exit(2)
+
     docs = args.docs or eng.list_docs()
     if not docs:
         print("No documents available under artifacts/indices/. Run your ingest first.", file=sys.stderr)
         sys.exit(2)
 
+    # Retrieve
     if args.expand:
-        queries, per_query_hits, fused_hits = eng.retrieve_with_llm_queries(
+        queries, per_query_hits, fused_hits_clip, fused_hits_all = eng.retrieve_with_llm_queries(
             args.question,
             include_docs=docs,
             n_queries=args.n_queries,
@@ -910,7 +957,6 @@ if __name__ == "__main__":
             bm25_weight=args.bm25 if _HAS_BM25 else 0.0,
             faiss_topk_per_doc=args.faiss_per_doc,
         )
-
         print("\n=== LLM Expanded Queries ===")
         for idx, q in enumerate(queries, 1):
             print(f"{idx}. {q}")
@@ -919,7 +965,8 @@ if __name__ == "__main__":
         for q, hits in zip(queries, per_query_hits):
             _print_query_results(q, hits, args.preview, args.per_query_print_k)
 
-        hits = fused_hits
+        hits_for_answer = fused_hits_all
+        hits_for_print = fused_hits_clip
     else:
         hits = eng.retrieve(
             args.question,
@@ -928,28 +975,31 @@ if __name__ == "__main__":
             bm25_weight=args.bm25 if _HAS_BM25 else 0.0,
             faiss_topk_per_doc=args.faiss_per_doc,
         )
+        hits_for_answer = hits
+        hits_for_print = hits
 
-    if not hits:
+    if not hits_for_answer:
         print("\nNo hits.")
         sys.exit(0)
-        
-    answer_json = None
-    if args.answer and hits:
-        answer_json = answer_question_with_batches(
-            args.question,
-            hits,
-            deployment=args.deployment,
-            api_version=args.api_version,
-            max_chunks_per_call=5,
-            max_blocks_per_hit=3,
-            max_lines_per_block=12,
-        )
-        
-        
-        # Always prepare paths (even if --answer-out omitted)
-        primary_path, session_path = _prepare_answer_paths(args.answer_out)
 
-        # Write primary ONLY if it doesn't already exist
+    # Answer
+    answer_json = None
+    if args.answer:
+        try:
+            answer_json = answer_question_with_batches(
+                args.question,
+                hits_for_answer,
+                deployment=args.deployment,
+                api_version=args.api_version,
+                max_chunks_per_call=max(1, args.answer_batch_size),
+                max_blocks_per_hit=3,
+                max_lines_per_block=12,
+            )
+        except Exception as e:
+            print(f"Answer generation failed: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        primary_path, session_path = _prepare_answer_paths(args.answer_out)
         if not primary_path.exists():
             with open(primary_path, "w", encoding="utf-8") as f:
                 json.dump(answer_json, f, ensure_ascii=False, indent=2)
@@ -957,12 +1007,10 @@ if __name__ == "__main__":
         else:
             print(f"(Primary exists, not overwritten: {primary_path})")
 
-        # Always write a session copy
         with open(session_path, "w", encoding="utf-8") as f:
             json.dump(answer_json, f, ensure_ascii=False, indent=2)
         print(f"(Session copy written to {session_path})")
-                
-    if answer_json:
+
         print("\n=== Unified JSON Answer (summary) ===")
         print(f"Primary path: {primary_path}")
         print(f"Session path: {session_path}")
@@ -972,16 +1020,18 @@ if __name__ == "__main__":
         if args.answer_out:
             print(f"(Full JSON written to {args.answer_out})")
 
+    # Console: final hits (clipped)
     print("\n=== Final Top Hits ===")
-    for i, h in enumerate(hits, 1):
+    from textwrap import shorten
+    for i, h in enumerate(hits_for_print, 1):
         cite = f"{h.citation['file']} {h.citation['pages']} (cols {h.citation['columns']})"
         txt = h.text.replace("\n", " ")
-        from textwrap import shorten
         snippet = shorten(txt, width=args.preview, placeholder=" …") if args.preview > 0 else txt
         print(f"[{i}] score={h.score:+.3f}  {cite}\n    {snippet}")
         print(f"    Blocks: {', '.join(h.citation['block_ids'])}")
         all_ids: List[str] = h.citation.get("line_ids_all") or []
-        print(f"    Line IDs: {', '.join(all_ids)}")
+        if all_ids:
+            print(f"    Line IDs: {', '.join(all_ids)}")
 
         prev, nxt = eng.get_neighbors(h)
         if prev:

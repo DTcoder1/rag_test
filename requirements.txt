@@ -1,0 +1,14 @@
+# PDF parsing
+pymupdf
+
+# Vector search
+faiss-cpu
+
+# Embeddings + sentence encoders
+sentence-transformers
+
+# Numerical utils
+numpy
+
+# Progress bars
+tqdm

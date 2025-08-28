@@ -1,0 +1,5 @@
+__test_data__
+.venv
+artifacts
+.env
+out

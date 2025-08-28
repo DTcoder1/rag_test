@@ -5,24 +5,26 @@
 # (optional) pip install cross-encoder
 #
 # CLI:
-#   python rag_reference.py --text "Your paragraph here." --docs paperA paperB --deployment gpt-4o --trace
-#   cat story.txt | python rag_reference.py --docs paperA paperB --deployment gpt-4o --trace
+#   python rag_reference.py --text "Your paragraph here." --docs paperA paperB --deployment gpt-4o --trace --out out/ref.json
+#   cat story.txt | python rag_reference.py --docs paperA paperB --deployment gpt-4o --trace --out out/ref.json
 #
 # Output JSON keys (block-first):
-#   - annotated_paragraph: str
-#   - block_citations: [{
-#        block_id: str,                        # inferred from supporting hit
-#        neighbor_block_ids: [prev, next],     # may include "" if not present
-#        source_ids: [int,...],
-#        query_transforms: [str,...]
-#     }]
+#   - annotated_paragraph: str                            # with [@source_k] style markers
+#   - paragraph_sources: [                                # NEW: per sentence mapping you asked for
+#       {
+#         sentence_index: int,
+#         source_tags: ["@source_1", ...],
+#         blocks: [ {block_id: str, why_used: str}, ... ] # reasons are specific to THIS sentence's claim
+#       }, ...
+#     ]
+#   - block_citations: [{block_id, neighbor_block_ids:[prev,next], source_tags:[...], query_transforms:[...]}]
 #   - query_transforms_by_block: [{block_id, transforms:[...]}]
-#   - sources: [ CHOSEN sources only, with neighbors ]
-#   - retrieved_sources: [ ALL retrieved (pre-validation) with neighbors ]
-#   - sentence_citations: [{sentence_index, source_ids:[int,...]}]   # legacy/back-compat
+#   - sentence_citations: [{sentence_index, source_tags:[...]}]     # legacy/back-compat with tag style
 #   - citation_decisions: [{sentence_index, needs: bool, reason: str, category: str}]
+#   - sources: [ CHOSEN sources (full metadata) ]                    # keep for audits
+#   - retrieved_sources: [ ALL retrieved (pre-validation) ]          # exhaustive, no source_ids
 #   - notes: str
-#   - trace: [ ... ]                         # when --trace is set
+#   - trace: [ ... ]                                                 # when --trace is set
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -120,6 +123,22 @@ def _load_doc_index(docstem: str):
 
     return index, vecid_to_chunkid, chunk_by_id, texts_for_bm25, ids_for_bm25
 
+def _append_refs(sentence: str, ids: List[int]) -> str:
+    if not ids:
+        return sentence
+    ids_str = ", ".join(str(i) for i in ids)
+    m = re.search(r'([.!?])\s*$', sentence)
+    if m:
+        start = m.start(1)
+        return sentence[:start] + f" [{ids_str}]" + sentence[start:]
+    else:
+        return sentence.rstrip() + f" [{ids_str}]"
+
+def _fix_spacing(parts: List[str]) -> List[str]:
+    out: List[str] = []
+    for p in parts:
+        out.append(re.sub(r'\s+', ' ', p).strip())
+    return out
 # -------------------- small text utils --------------------
 
 _SENT_SPLIT = re.compile(r'(?<!\b[A-Z])[.!?](?=\s+|$)')
@@ -152,6 +171,100 @@ def _json_loads_relaxed(s: str) -> Optional[dict]:
                 except Exception:
                     pass
     return None
+
+def _prepare_output_paths(out_path: Optional[str]) -> Tuple[Path, Path]:
+    base = Path(out_path) if out_path else Path("out") / "reference.json"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = base.parent / stamp
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_path = session_dir / base.name
+    return base, session_path
+
+def save_annotation_json(obj: Dict[str, Any], out_path: Optional[str] = None) -> Tuple[Path, Path, Path]:
+    """
+    Save annotated JSON and return (primary_json, session_json, base_dir).
+    """
+    primary_path, session_path, base_dir = _out_paths(out_path)
+    if not primary_path.exists():
+        with open(primary_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        print(f"(Primary JSON written to {primary_path})")
+    else:
+        print(f"(Primary exists, not overwritten: {primary_path})")
+    with open(session_path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    print(f"(Session copy written to {session_path})")
+    return primary_path, session_path, base_dir
+
+def _build_source_legend(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Compact, UI-friendly quick map for tag → minimal citation.
+    """
+    def row(s: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "tag": s.get("tag", f"@source_{s['source_id']}"),
+            "file": s.get("file",""),
+            "page": s.get("page",""),
+            "block_id": s.get("block_id",""),
+            "address": s.get("address",""),
+            "why_used": s.get("why_used",""),
+            "snippet": (s.get("snippet","") or "")[:240],
+        }
+    return [row(s) for s in sorted(sources, key=lambda x: x["source_id"])]
+
+def save_sidecar_views(out_obj: Dict[str, Any], base_dir: Path, base_name: str = "reference") -> Tuple[Path, Path]:
+    """
+    Writes two *extra* files next to the main JSON:
+      - {base_name}.paragraph.json  (annotated_paragraph + paragraph_sources)
+      - {base_name}.sources.json    (map from @source_k -> {content, why_used, ...})
+    Returns (paragraph_path, sources_map_path).
+    """
+    paragraph_path = base_dir / f"{base_name}.paragraph.json"
+    sources_map_path = base_dir / f"{base_name}.sources.json"
+
+    # 1) paragraph sidecar
+    paragraph_sidecar = {
+        "annotated_paragraph": out_obj.get("annotated_paragraph",""),
+        "paragraph_sources": out_obj.get("paragraph_sources", []),
+    }
+    with open(paragraph_path, "w", encoding="utf-8") as f:
+        json.dump(paragraph_sidecar, f, ensure_ascii=False, indent=2)
+
+    # 2) sources map sidecar: tag -> content & why_used (+ a bit of provenance)
+    srcs = out_obj.get("sources", [])
+    tag_map: Dict[str, Dict[str, Any]] = {}
+    for s in srcs:
+        tag = s.get("tag") or f"@source_{s['source_id']}"
+        tag_map[tag] = {
+            "content": s.get("snippet",""),
+            "why_used": s.get("why_used",""),
+            "file": s.get("file",""),
+            "page": s.get("page",""),
+            "block_id": s.get("block_id",""),
+            "address": s.get("address",""),
+        }
+    with open(sources_map_path, "w", encoding="utf-8") as f:
+        json.dump(tag_map, f, ensure_ascii=False, indent=2)
+
+    print(f"(Sidecars written: {paragraph_path.name}, {sources_map_path.name})")
+    return paragraph_path, sources_map_path
+
+
+def _out_paths(out_path: Optional[str]) -> Tuple[Path, Path, Path]:
+    """
+    Returns (primary_json, session_json, session_dir)
+    - primary_json: main JSON path (not overwritten if exists)
+    - session_json: timestamped copy
+    - session_dir: timestamped directory (where sidecar files will be written)
+    """
+    base = Path(out_path) if out_path else Path("out") / "reference.json"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = base.parent / stamp
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return base, (session_dir / base.name), session_dir 
+
 
 # -------------------- data models --------------------
 
@@ -373,10 +486,10 @@ class RAGEngine:
 _SUPERVISOR_POLICY = (
     "You are a research supervisor enforcing academic citation standards. "
     "For each sentence, decide if an external citation is REQUIRED. "
-    "Require citation for: empirical or quantitative claims; statements about benchmarks, SOTA, or performance; "
-    "specific methods/datasets/results; stats, counts, comparisons, timelines; factual assertions not common knowledge; "
-    "claims about impact or prevalence; domain-specific assertions that would normally be referenced. "
-    "Do NOT require citation for: author opinions, writing glue, obvious/common-knowledge facts, task intent, or purely stylistic content. "
+    "Require citation for: empirical/quantitative claims; benchmarks/SOTA/performance; "
+    "specific methods/datasets/results; stats/comparisons/timelines; non-obvious factual assertions; "
+    "claims about impact or prevalence. "
+    "Do NOT require citation for: clear opinions, connective glue, obvious common knowledge, or stylistic content. "
     'Return STRICT JSON: {"decisions":[{"index":int,"needs":true|false,"reason":str,"category":str}], "notes":str}'
 )
 
@@ -387,15 +500,13 @@ def supervisor_decide_needs_citation(
     deployment: Optional[str],
     api_version: str = "2024-12-01-preview",
 ) -> List[Dict[str, Any]]:
-    """Batch classify sentences with Azure OpenAI; fallback: cite if sentence is long or looks claim-y."""
     if not _HAS_AZURE_OPENAI or not deployment:
-        # conservative fallback: flag most content-rich sentences
         dec = []
         for i, s in enumerate(sentences):
             tok = len(re.findall(r"\w+", s))
             has_num = bool(re.search(r"\d|%|20\d{2}", s))
-            looks_claimy = any(t in s.lower() for t in ["improve", "increase", "decrease", "outperform", "accuracy", "benchmark", "study", "report", "dataset"])
-            need = has_num or tok >= 16 or looks_claimy
+            looks = any(t in s.lower() for t in ["improve", "increase", "decrease", "outperform", "accuracy", "benchmark", "study", "report", "dataset", "evidence", "hallucination"])
+            need = has_num or tok >= 16 or looks
             dec.append({"index": i, "needs": bool(need), "reason": "fallback_heuristic", "category": "fallback"})
         tracer.log("supervisor_decision_fallback", decisions=dec[:20])
         return dec
@@ -411,25 +522,17 @@ def supervisor_decide_needs_citation(
             {"role": "user", "content": user_msg},
         ],
         name="needs_citation_supervisor",
-        temperature=0.0,
-        top_p=0.9,
-        max_tokens=800,
+        temperature=0.0, top_p=0.9, max_tokens=800,
         response_format={"type": "json_object"},
     )
     obj = _json_loads_relaxed(content) or {}
     decisions = obj.get("decisions", [])
     out: List[Dict[str, Any]] = []
-    # sanitize and ensure coverage
-    index_set = {d.get("index") for d in decisions if isinstance(d, dict)}
-    for i, s in enumerate(sentences):
-        if i in index_set:
+    idxset = {d.get("index") for d in decisions if isinstance(d, dict)}
+    for i, _ in enumerate(sentences):
+        if i in idxset:
             d = [x for x in decisions if x.get("index") == i][0]
-            out.append({
-                "index": i,
-                "needs": bool(d.get("needs", False)),
-                "reason": str(d.get("reason", "") or ""),
-                "category": str(d.get("category", "") or "")
-            })
+            out.append({"index": i, "needs": bool(d.get("needs", False)), "reason": str(d.get("reason","")), "category": str(d.get("category",""))})
         else:
             out.append({"index": i, "needs": False, "reason": "not_listed_by_llm", "category": ""})
     tracer.log("supervisor_decision_result", sample=out[:20])
@@ -452,19 +555,19 @@ def query_transform(
         short = " ".join(words[:min(12, len(words))])
         queries = list(dict.fromkeys([
             short,
-            f"{short} evidence",
             f"{short} results",
+            f"{short} dataset",
             f"{short} benchmark",
-            f"{short} dataset"
+            f"{short} evidence"
         ]))[:n]
         tracer.log("query_transform_fallback", claim=claim_with_context, queries=queries)
         return queries
 
     llm = ChatLLM(tracer=tracer, deployment=deployment, api_version=api_version)
     sys_msg = (
-        "You act as a meticulous research supervisor creating high-recall verification queries for fact-checking one claim WITH its local context. "
+        "You are a meticulous research supervisor creating high-recall verification queries for a claim WITH local context. "
         f"Produce EXACTLY {n} diverse, precise queries (≤16 words each). "
-        "Expand key terms with synonyms, dataset/task names, metrics, and likely section headers. "
+        "Expand key nouns with synonyms, dataset/task names, metrics, and likely section headers. "
         'Return ONLY JSON: {"queries": ["...","...","...","...","..."]}.'
     )
     if extra_instructions:
@@ -476,9 +579,7 @@ def query_transform(
             {"role": "user", "content": claim_with_context.strip()},
         ],
         name="query_transform",
-        temperature=0.2,
-        top_p=0.95,
-        max_tokens=700,
+        temperature=0.2, top_p=0.95, max_tokens=700,
         response_format={"type": "json_object"},
     )
     obj = _json_loads_relaxed(content) or {}
@@ -536,8 +637,10 @@ def _register_source(
         sid = next_id
         source_key_to_id[skey] = sid
         next_id += 1
+        tag = f"@source_{sid}"
         src = {
             "source_id": sid,
+            "tag": tag,                              # <-- NEW
             "doc": hit.doc,
             "chunk_id": hit.id,
             "file": hit.citation.get("file",""),
@@ -552,6 +655,44 @@ def _register_source(
         sources.append(src)
     return source_key_to_id[skey], next_id
 
+def _source_tag(sid: int) -> str:
+    return f"@source_{sid}"
+
+# --- LLM: explain WHY a block supports this sentence (meaningful rationale) ---
+
+def llm_explain_why_used(
+    sentence: str,
+    block_snippet: str,
+    *,
+    tracer: Tracer,
+    deployment: Optional[str],
+    api_version: str = "2024-12-01-preview",
+) -> str:
+    if not _HAS_AZURE_OPENAI or not deployment:
+        # Compact heuristic
+        if len(block_snippet.strip()) < 12:
+            return "Provides defining detail directly aligned with the sentence's claim."
+        if any(k in sentence.lower() for k in ["accuracy","benchmark","efficiency","real-time","thermal","hallucinat","map","retrieval","maintenance","downtime"]):
+            return "Gives concrete evidence (metrics/examples) that substantiates the claim in this sentence."
+        return "Contains specific content that substantiates the claim in this sentence."
+    llm = ChatLLM(tracer=tracer, deployment=deployment, api_version=api_version)
+    sys_msg = (
+        "You are a research supervisor. In ONE short sentence (≤28 words), explain precisely how the quoted block supports the given sentence. "
+        "Be specific: reference what the block states (metric, dataset, mechanism, effect). Return plain text."
+    )
+    user_msg = json.dumps({"sentence": sentence.strip(), "block_snippet": block_snippet.strip()}, ensure_ascii=False)
+    content = llm.chat(
+        [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        name="why_used_explainer",
+        temperature=0.2, top_p=0.9, max_tokens=120,
+    )
+    return content.strip().strip('"').strip()
+
+# -------------------- Candidate validation (kept) --------------------
+
 def validate_candidates_with_llm(
     claim: str,
     candidates: List[Dict[str, Any]],
@@ -563,7 +704,7 @@ def validate_candidates_with_llm(
     if not _HAS_AZURE_OPENAI or not deployment:
         out = []
         for c in candidates[:2]:
-            out.append({"idx": c["idx"], "why": "Top-ranked lexical/semantic match to the claim."})
+            out.append({"idx": c["idx"], "why": "Directly overlaps with key terms of the claim."})
         tracer.log("validation_fallback", claim=claim, chosen=[x["idx"] for x in out])
         return out
 
@@ -616,26 +757,23 @@ def annotate_paragraph(
     tracer.log("sentence_split", count=len(sentences), sentences=sentences[:20])
 
     if not sentences:
-        out = {"annotated_paragraph": paragraph, "sentence_citations": [], "block_citations": [], "sources": [], "retrieved_sources": [], "citation_decisions": [], "notes": "No sentences found."}
+        out = {"annotated_paragraph": paragraph, "sentence_citations": [], "block_citations": [], "sources": [], "retrieved_sources": [], "citation_decisions": [], "paragraph_sources": [], "notes": "No sentences found."}
         if trace:
             out["trace"] = tracer.dump()
         return out
 
-    # --- NEW: ask Azure (research supervisor) which sentences need citations ---
-    decisions = supervisor_decide_needs_citation(
-        sentences, tracer=tracer, deployment=deployment, api_version=api_version
-    )
+    decisions = supervisor_decide_needs_citation(sentences, tracer=tracer, deployment=deployment, api_version=api_version)
     needs_map: Dict[int, Dict[str, Any]] = {d["index"]: d for d in decisions}
 
-    # Outputs
-    sources: List[Dict[str, Any]] = []                 # chosen only
-    retrieved_sources: List[Dict[str, Any]] = []        # ALL retrieved candidates (pre-validation)
+    sources: List[Dict[str, Any]] = []
+    retrieved_sources: List[Dict[str, Any]] = []
     source_key_to_id: Dict[str, int] = {}
     next_id = 1
 
-    sentence_citations: List[Dict[str, Any]] = []       # legacy
-    block_citations: List[Dict[str, Any]] = []          # canonical
+    sentence_citations: List[Dict[str, Any]] = []
+    block_citations: List[Dict[str, Any]] = []
     query_transforms_by_block: List[Dict[str, Any]] = []
+    paragraph_sources: List[Dict[str, Any]] = []
 
     annotated_parts: List[str] = []
 
@@ -645,28 +783,28 @@ def annotate_paragraph(
     seen_retrieved: set[str] = set()
 
     for sidx, sent in enumerate(sentences):
-        need = bool(needs_map.get(sidx, {}).get("needs", False))
-        tracer.log("needs_citation_decision", sentence_index=sidx, sentence=sent, needs=need, reason=needs_map.get(sidx, {}).get("reason",""), category=needs_map.get(sidx, {}).get("category",""))
+        decision = needs_map.get(sidx, {})
+        need = bool(decision.get("needs", False))
+        tracer.log("needs_citation_decision", sentence_index=sidx, sentence=sent, needs=need, reason=decision.get("reason",""), category=decision.get("category",""))
         if not need:
             annotated_parts.append(sent)
             continue
 
-        # Build context block: sentence + prev + next
         prev_s = sentences[sidx - 1] if sidx - 1 >= 0 else ""
         next_s = sentences[sidx + 1] if sidx + 1 < len(sentences) else ""
         claim_with_context = f"CLAIM: {sent.strip()}\nCONTEXT:\nPrev: {prev_s.strip()}\nNext: {next_s.strip()}"
 
-        # 1) Query transform (supervisor style)
+        # 1) Query transform
         queries = query_transform(
             claim_with_context,
             tracer=tracer,
             n=per_sentence_queries,
             deployment=deployment,
             api_version=api_version,
-            extra_instructions="Leverage the claim + context; prefer including dataset/metric/task names; avoid overly long queries.",
+            extra_instructions="Leverage claim + context; include dataset/metric/task names where applicable; avoid long queries.",
         )
 
-        # 2) Retrieve per query (pool)
+        # 2) Retrieve across queries (pool)
         pooled: Dict[Tuple[str, str], Hit] = {}
         for q in queries:
             hits = engine.retrieve(q, include_docs=include_docs, top_k_after_mmr=per_query_topk)
@@ -675,7 +813,7 @@ def annotate_paragraph(
                 if key not in pooled or h.score > pooled[key].score:
                     pooled[key] = h
 
-                # register ALL retrieved (pre-validation) with neighbors
+                # log ALL retrieved (pre-validation)
                 line_ids, line_texts, blk, neighbors = _evidence_lines_from_hit(h, max_lines=4)
                 snippet = " ".join([t for t in line_texts if t]).strip() or h.text.replace("\n"," ")[:400]
                 if blk:
@@ -701,11 +839,12 @@ def annotate_paragraph(
 
         if not cand_hits:
             annotated_parts.append(_append_refs(sent, []))
-            block_citations.append({"block_id": "", "neighbor_block_ids": ["",""], "source_ids": [], "query_transforms": queries})
+            block_citations.append({"block_id": "", "neighbor_block_ids": ["",""], "source_tags": [], "query_transforms": queries})
             query_transforms_by_block.append({"block_id": "", "transforms": queries})
+            paragraph_sources.append({"sentence_index": sidx, "source_tags": [], "blocks": []})
             continue
 
-        # 3) Build candidate snippets
+        # 3) Candidates
         candidates: List[Dict[str, Any]] = []
         for idx, h in enumerate(cand_hits):
             line_ids, line_texts, blk, neighbors = _evidence_lines_from_hit(h, max_lines=4)
@@ -720,7 +859,7 @@ def annotate_paragraph(
             })
         tracer.log("candidates_built", sentence_index=sidx, candidates=[{"idx": c["idx"], "doc": c["hit"].doc, "chunk_id": c["hit"].id, "block_id": c["block_id"]} for c in candidates])
 
-        # 4) Validate with LLM
+        # 4) Validate
         supported = validate_candidates_with_llm(sent, candidates, tracer=tracer, deployment=deployment, api_version=api_version)
         supported_map = {x["idx"]: (x.get("why","").strip() or "Supports the claim.") for x in supported}
         chosen: List[int] = []
@@ -732,16 +871,19 @@ def annotate_paragraph(
         if not chosen:
             chosen = list(range(min(max_sources_per_sentence, len(candidates))))
             for i in chosen:
-                supported_map.setdefault(i, "Top-ranked match used as fallback.")
-        tracer.log("chosen_candidates", sentence_index=sidx, chosen=chosen)
+                supported_map.setdefault(i, "Overlaps with pivotal terms and concepts in the claim.")
 
-        # 5) Assign source IDs & register (chosen)
+        # 5) Register sources & produce reasons per BLOCK (for THIS sentence)
         this_sentence_source_ids: List[int] = []
+        blocks_for_sentence: List[Dict[str, str]] = []
         unit_block_id = ""
         unit_neighbors = ["",""]
+
         for i in chosen:
             c = candidates[i]
             h = c["hit"]
+            # reason generation (specific to this sentence + this block snippet)
+            reason = llm_explain_why_used(sent, c["text"], tracer=tracer, deployment=deployment, api_version=api_version)
             sid, next_id = _register_source(
                 sources, source_key_to_id, next_id,
                 hit=h,
@@ -749,36 +891,49 @@ def annotate_paragraph(
                 block_id=c["block_id"],
                 neighbor_block_ids=c["neighbor_block_ids"],
                 line_ids=c["line_ids"],
-                why_used=supported_map.get(i, ""),
+                why_used=reason,
             )
             this_sentence_source_ids.append(sid)
+            blocks_for_sentence.append({"block_id": c["block_id"], "why_used": reason})
             if not unit_block_id and c["block_id"]:
                 unit_block_id = c["block_id"]
                 unit_neighbors = c["neighbor_block_ids"]
 
-        this_sentence_source_ids = sorted(set(this_sentence_source_ids))
-        annotated_parts.append(_append_refs(sent, this_sentence_source_ids))
-        sentence_citations.append({"sentence_index": sidx, "source_ids": this_sentence_source_ids})
-
-        # Record block-first structure
+        # Inline markers as @source_k
+        tag_list = [f"@source_{sid}" for sid in sorted(set(this_sentence_source_ids))]
+        annotated_parts.append(_append_refs_with_tags(sent, tag_list))
+        sentence_citations.append({"sentence_index": sidx, "source_tags": tag_list})
         block_citations.append({
             "block_id": unit_block_id,
             "neighbor_block_ids": unit_neighbors,
-            "source_ids": this_sentence_source_ids,
+            "source_tags": tag_list,
             "query_transforms": queries
         })
         query_transforms_by_block.append({"block_id": unit_block_id, "transforms": queries})
 
+        # NEW: paragraph_sources row
+        paragraph_sources.append({
+            "sentence_index": sidx,
+            "source_tags": tag_list,
+            "blocks": blocks_for_sentence
+        })
+
     annotated_paragraph = " ".join(_fix_spacing(annotated_parts))
+    source_legend = _build_source_legend(sources)
     out: Dict[str, Any] = {
         "annotated_paragraph": annotated_paragraph,
+        "paragraph_sources": paragraph_sources,
         "block_citations": block_citations,
         "query_transforms_by_block": query_transforms_by_block,
-        "sentence_citations": sentence_citations,  # legacy/back-compat
+        "sentence_citations": sentence_citations,
         "sources": sorted(sources, key=lambda s: s["source_id"]),
-        "retrieved_sources": retrieved_sources,     # exhaustive list of what was looked at
-        "citation_decisions": [{"sentence_index": d["index"], "needs": d["needs"], "reason": d.get("reason",""), "category": d.get("category","")} for d in decisions],
-        "notes": "Supervisor-LLM decision for citation need + query transform + hybrid retrieval + LLM validation. Outputs are block-first with neighbor context.",
+        "source_legend": source_legend,   # <-- NEW
+        "retrieved_sources": retrieved_sources,
+        "citation_decisions": [
+            {"sentence_index": d["index"], "needs": d["needs"], "reason": d.get("reason",""), "category": d.get("category","")}
+            for d in decisions
+        ],
+        "notes": "Supervisor LLM + context-aware query transforms + hybrid retrieval + LLM selection; per-sentence block reasons; tag-style inline citations.",
     }
     if trace:
         out["trace"] = tracer.dump()
@@ -786,10 +941,10 @@ def annotate_paragraph(
 
 # -------------------- formatting helpers --------------------
 
-def _append_refs(sentence: str, ids: List[int]) -> str:
-    if not ids:
+def _append_refs_with_tags(sentence: str, tags: List[str]) -> str:
+    if not tags:
         return sentence
-    ids_str = ", ".join(str(i) for i in ids)
+    ids_str = ", ".join(tags)
     m = re.search(r'([.!?])\s*$', sentence)
     if m:
         start = m.start(1)
@@ -814,7 +969,7 @@ def _read_stdin_if_needed() -> Optional[str]:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="RAG-Reference (block-first): Azure-supervised citation decisions + query transform + retrieval + validation.")
+    ap = argparse.ArgumentParser(description="RAG-Reference (block-first): Azure-supervised citation decisions + context-aware query transforms + retrieval + validation + per-sentence block reasons.")
     ap.add_argument("--text", type=str, default=None, help="Paragraph text. If omitted, reads stdin.")
     ap.add_argument("--docs", nargs="*", default=None, help="Docstems to search (default: all available).")
     ap.add_argument("--deployment", type=str, default=None, help="Azure OpenAI deployment (e.g., gpt-4o).")
@@ -824,6 +979,8 @@ def main():
     ap.add_argument("--candidate-consider", type=int, default=6, help="How many pooled candidates to validate per sentence.")
     ap.add_argument("--max-sources-per-sentence", type=int, default=3, help="Upper bound on citations per sentence.")
     ap.add_argument("--trace", action="store_true", help="Include detailed trace (plus stderr prints).")
+    ap.add_argument("--out", type=str, default=None, help="Write annotated JSON to this path (and a timestamped session copy)")
+
     args = ap.parse_args()
 
     text = args.text or _read_stdin_if_needed()
@@ -843,6 +1000,18 @@ def main():
             max_sources_per_sentence=args.max_sources_per_sentence,
             trace=args.trace,
         )
+        base_dir_for_sidecars = None
+        if args.out:
+            try:
+                primary_path, session_path, base_dir = save_annotation_json(out, args.out)
+                base_dir_for_sidecars = base_dir
+                print(f"\n=== JSON Saved ===\nPrimary: {primary_path}\nSession: {session_path}")
+            except Exception as e:
+                print(f"(Failed to save JSON: {e})", file=sys.stderr)
+
+        # Always write sidecars if we have a base_dir (i.e., when --out is provided)
+        if base_dir_for_sidecars:
+            save_sidecar_views(out, base_dir_for_sidecars, base_name=Path(args.out).stem if args.out else "reference")
     except Exception as e:
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
         sys.exit(1)
